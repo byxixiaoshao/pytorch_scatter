@@ -1,0 +1,102 @@
+name: Building Wheels
+
+on: [workflow_dispatch]
+
+jobs:
+  wheel:
+    # 仅保留Windows 2022（非ARM）
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 仅保留目标环境，其余全部注释/删除
+        os: [windows-2022]
+        python-version: ['3.12']
+        torch-version: [2.7.0]
+        cuda-version: ['cu128']
+        # 原exclude全部删除（无需要排除的组合）
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Upgrade pip
+        run: |
+          pip install --upgrade setuptools
+          pip install wheel
+
+      # 注释Ubuntu清理磁盘步骤（仅Windows环境，无需此步骤）
+      # - name: Free Disk Space (Ubuntu)
+      #   if: ${{ runner.os == 'Linux' }}
+      #   uses: jlumbroso/free-disk-space@main
+
+      - name: Install CUDA ${{ matrix.cuda-version }}
+        if: ${{ matrix.cuda-version != 'cpu' }}
+        run: |
+          bash .github/workflows/cuda/${{ matrix.cuda-version }}-${{ runner.os }}.sh
+
+      - name: Install PyTorch ${{ matrix.torch-version }}+${{ matrix.cuda-version }}
+        run: |
+          # 修正PyTorch安装命令（适配cu128+2.7.0）
+          pip install torch==${{ matrix.torch-version }}+${{ matrix.cuda-version }} --index-url https://download.pytorch.org/whl/${{ matrix.cuda-version }}
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "import torch; print('CUDA:', torch.version.cuda)"
+
+      - name: Patch PyTorch static constexpr on Windows
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          Torch_DIR=`python -c 'import os; import torch; print(os.path.dirname(torch.__file__))'`
+          sed -i '31,38c\
+          TORCH_API void lazy_init_num_threads();' ${Torch_DIR}/include/ATen/Parallel.h
+        shell: bash
+
+      - name: Set version
+        if: ${{ runner.os != 'macOS' }}
+        run: |
+          VERSION=`sed -n "s/^__version__ = '\(.*\)'/\1/p" torch_scatter/__init__.py`
+          TORCH_VERSION=`echo "pt${{ matrix.torch-version }}" | sed "s/..$//" | sed "s/\.//g"`
+          CUDA_VERSION=`echo ${{ matrix.cuda-version }}`
+          echo "New version name: $VERSION+$TORCH_VERSION$CUDA_VERSION"
+          sed -i "s/$VERSION/$VERSION+$TORCH_VERSION$CUDA_VERSION/" setup.py
+          sed -i "s/$VERSION/$VERSION+$TORCH_VERSION$CUDA_VERSION/" torch_scatter/__init__.py
+        shell:
+          bash
+
+      # 注释CPU编译步骤（仅编译CUDA版本）
+      # - name: Build wheel for CPU
+      #   if: ${{ matrix.cuda-version == 'cpu' }}
+      #   run: |
+      #     FORCE_ONLY_CPU=1 python setup.py bdist_wheel --dist-dir=dist
+      #   shell:
+      #     bash
+
+      - name: Build wheel for GPU
+        if: ${{ matrix.cuda-version != 'cpu' }}
+        run: |
+          source .github/workflows/cuda/${{ matrix.cuda-version }}-${{ runner.os }}-env.sh
+          FORCE_CUDA=1 python setup.py bdist_wheel --dist-dir=dist
+        shell:
+          bash
+
+      # 注释AWS上传步骤（若无AWS密钥会报错，编译后可手动下载artifact）
+      # - name: Configure AWS
+      #   uses: aws-actions/configure-aws-credentials@v1
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: us-west-1
+
+      # - name: Upload wheel to S3
+      #   run: |
+      #     aws s3 sync dist s3://data.pyg.org/whl/torch-${{ matrix.torch-version }}+${{ matrix.cuda-version }} --grants read=uri=http://acs.amazonaws.com/groups/global/AllUsers
+
+      # 新增：将编译好的wheel上传为GitHub Artifact（方便手动下载）
+      - name: Upload wheel as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: torch_scatter-cp312-cu128-win2022
+          path: dist/*.whl
